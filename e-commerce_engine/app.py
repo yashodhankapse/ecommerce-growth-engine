@@ -1,313 +1,542 @@
-import streamlit as st
+import os
+import uuid
+from pathlib import Path
+
 import pandas as pd
-from datetime import datetime
+import plotly.express as px
+import streamlit as st
 
-# =====================================================================
-# E-COMMERCE BUSINESS INTELLIGENCE APP  (College Project - Simple Version)
-# =====================================================================
-# This app has 2 types of users:
-#   1) User     -> uploads a data file (CSV/Excel)
-#   2) Analyst  -> looks at the file, analyzes it, and marks it done
-#
-# It also has a simple chatbot that can answer basic questions
-# about the uploaded data.
-# =====================================================================
+from backend.database import init_db
+from backend.auth import register_user, authenticate_user
+from backend.repository import (
+    save_upload,
+    get_uploads,
+    get_upload,
+    save_report,
+    get_reports
+)
+from backend.analytics import (
+    load_dataset,
+    analyze_dataset,
+    generate_report
+)
 
+st.set_page_config(
+    page_title="E-Commerce BI",
+    page_icon="📊",
+    layout="wide"
+)
 
-st.set_page_config(page_title="E-Commerce Business Intelligence", page_icon="📊", layout="wide")
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+init_db()
 
-# ---------------------------------------------------------------------
-# SHARED STORAGE
-# ---------------------------------------------------------------------
-# Normally, User login and Analyst login are two separate browser
-# sessions, and Streamlit does NOT share data between sessions by
-# default. To make the User's uploaded file visible to the Analyst,
-# we need one "shared memory box" that both sides can read/write.
-#
-# @st.cache_resource creates that shared box. Unlike a normal variable,
-# it is created ONLY ONCE and stays alive for everyone using the app,
-# like a shared notebook kept on the server.
-# ---------------------------------------------------------------------
+st.markdown("""
+<style>
+.stApp {
+    background-color: #f4f7ff;
+}
+[data-testid="stSidebar"] {
+    background-color: #312e81;
+}
+.hero {
+    padding: 25px;
+    border-radius: 15px;
+    background: linear-gradient(120deg, #4f46e5, #7c3aed);
+    color: white;
+}
+.hero h1 {
+    color: white;
+}
+</style>
+""", unsafe_allow_html=True)
 
-@st.cache_resource
-def get_shared_storage():
-    return {"files": []}          # a list that will hold all uploaded files
+if "user" not in st.session_state:
+    st.session_state.user = None
 
-
-storage = get_shared_storage()
-
-
-# Fixed analyst account (for a real app, this would come from a database)
-ANALYST_EMAIL = "analyst@ecommerce.com"
-ANALYST_PASSWORD = "analyst123"
-
-
-# ---------------------------------------------------------------------
-# SESSION STATE
-# ---------------------------------------------------------------------
-# session_state remembers values for ONE user while they click around
-# the app (otherwise Streamlit would forget everything on every click).
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-
-if "role" not in st.session_state:
-    st.session_state.role = None
-
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
+if "selected_upload_id" not in st.session_state:
+    st.session_state.selected_upload_id = None
 
 
-# ---------------------------------------------------------------------
-# SIMPLE HELPER FUNCTIONS
-# ---------------------------------------------------------------------
-
-def read_uploaded_file(uploaded_file):
-    """Reads a CSV or Excel file into a pandas DataFrame (a table)."""
-    if uploaded_file.name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    else:
-        return pd.read_excel(uploaded_file)
-
-
-def analyze_data(df):
-    """A very simple 'analysis': basic stats about the data."""
-    report = ""
-    report += "Number of rows: " + str(df.shape[0]) + "\n"
-    report += "Number of columns: " + str(df.shape[1]) + "\n\n"
-
-    numeric_columns = df.select_dtypes(include="number").columns
-
-    if len(numeric_columns) > 0:
-        report += "Column averages:\n"
-        for col in numeric_columns:
-            avg = df[col].mean()
-            report += "- " + col + ": " + str(round(avg, 2)) + "\n"
-
-    missing_values = df.isnull().sum().sum()
-    report += "\nMissing values in file: " + str(missing_values)
-
-    return report
+def show_hero(title, subtitle):
+    st.markdown(
+        f"""
+        <div class="hero">
+            <h1>{title}</h1>
+            <p>{subtitle}</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 
-def chatbot_reply(question, df):
-    """A simple rule-based chatbot. It looks for keywords in the
-    question and replies with matching information. This is NOT real
-    AI - it just checks 'if this word is in the question, say this'."""
+def store_file(uploaded_file, user_id):
+    filename = Path(uploaded_file.name).name
+    unique_name = f"{user_id}_{uuid.uuid4().hex}_{filename}"
+    path = UPLOAD_DIR / unique_name
 
-    question = question.lower()
+    with open(path, "wb") as file:
+        file.write(uploaded_file.getbuffer())
 
-    if "hello" in question or "hi" in question:
-        return "Hello! Ask me about the data - like 'how many rows' or 'summary'."
-
-    if df is None:
-        return "No data is selected yet. Please upload or select a file first."
-
-    if "row" in question:
-        return "This file has " + str(df.shape[0]) + " rows."
-
-    if "column" in question:
-        return "The columns are: " + ", ".join(df.columns)
-
-    if "missing" in question:
-        return "Missing values: " + str(df.isnull().sum().sum())
-
-    if "summary" in question or "describe" in question:
-        return "Here is a quick summary:\n" + str(df.describe())
-
-    return "Sorry, I did not understand. Try asking about 'rows', 'columns', 'missing values' or 'summary'."
+    return path
 
 
-def show_chatbot(current_df):
-    """Displays the chatbot section (chat history + input box)."""
-    st.subheader("💬 Chatbot Assistant")
+def display_dataset(df):
+    if df.empty:
+        st.warning("Dataset is empty.")
+        return
 
-    for message in st.session_state.chat_messages:
-        with st.chat_message(message["sender"]):
-            st.write(message["text"])
+    stats = analyze_dataset(df)
 
-    user_question = st.chat_input("Ask something about your data...")
+    col1, col2, col3, col4 = st.columns(4)
 
-    if user_question:
-        st.session_state.chat_messages.append({"sender": "user", "text": user_question})
-        bot_answer = chatbot_reply(user_question, current_df)
-        st.session_state.chat_messages.append({"sender": "assistant", "text": bot_answer})
-        st.rerun()
+    col1.metric("Records", stats["rows"])
+    col2.metric("Columns", stats["columns"])
+    col3.metric("Missing Values", stats["missing"])
+    col4.metric("Duplicates", stats["duplicates"])
 
+    st.subheader("Dataset Preview")
+    st.dataframe(df.head(100), use_container_width=True)
 
-# =====================================================================
-# LOGIN PAGE
-# =====================================================================
+    tab1, tab2, tab3 = st.tabs([
+        "Charts",
+        "Filter Data",
+        "Statistics"
+    ])
 
-if st.session_state.logged_in == False:
+    with tab1:
+        columns = df.columns.tolist()
+        numeric_columns = df.select_dtypes(
+            include="number"
+        ).columns.tolist()
 
-    st.title("📊 E-Commerce Business Intelligence")
-    st.write("Login to continue")
+        x_column = st.selectbox(
+            "X-axis",
+            columns,
+            key="x_axis"
+        )
 
-    role = st.selectbox("Login as", ["User", "Analyst"])
-    email = st.text_input("Email")
-    password = st.text_input("Password", type="password")
+        chart_type = st.selectbox(
+            "Chart Type",
+            ["Bar Chart", "Line Chart", "Histogram", "Pie Chart"],
+            key="chart_type"
+        )
 
-    if role == "Analyst":
-        st.caption("Demo Analyst login: analyst@ecommerce.com / analyst123")
+        if chart_type == "Histogram":
+            fig = px.histogram(df, x=x_column)
 
-    if st.button("Login"):
+        elif chart_type == "Pie Chart":
+            chart_data = (
+                df[x_column]
+                .astype(str)
+                .value_counts()
+                .head(15)
+                .reset_index()
+            )
+            chart_data.columns = ["Category", "Count"]
 
-        if role == "User":
-            if email != "" and password != "":
-                st.session_state.logged_in = True
-                st.session_state.role = "User"
-                st.session_state.user_email = email
-                st.rerun()
+            fig = px.pie(
+                chart_data,
+                names="Category",
+                values="Count"
+            )
+
+        elif numeric_columns:
+            y_column = st.selectbox(
+                "Y-axis",
+                numeric_columns,
+                key="y_axis"
+            )
+
+            if chart_type == "Bar Chart":
+                fig = px.bar(
+                    df.head(500),
+                    x=x_column,
+                    y=y_column
+                )
             else:
-                st.error("Please enter email and password.")
+                fig = px.line(
+                    df.head(500),
+                    x=x_column,
+                    y=y_column
+                )
 
-        else:  # role == "Analyst"
-            # .strip() removes accidental spaces, .lower() ignores capital letters
-            # This fixes the common bug of "Invalid Credentials" caused by a
-            # stray space or different letter case when typing the email.
-            entered_email = email.strip().lower()
-            entered_password = password.strip()
+        else:
+            st.info("No numeric columns available for this chart.")
+            fig = None
 
-            if entered_email == ANALYST_EMAIL and entered_password == ANALYST_PASSWORD:
-                st.session_state.logged_in = True
-                st.session_state.role = "Analyst"
-                st.rerun()
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        filter_column = st.selectbox(
+            "Select column",
+            df.columns.tolist(),
+            key="filter_column"
+        )
+
+        if pd.api.types.is_numeric_dtype(df[filter_column]):
+            values = df[filter_column].dropna()
+
+            if values.empty:
+                filtered_df = df.iloc[0:0]
             else:
-                st.error("Invalid Analyst credentials.")
+                minimum = float(values.min())
+                maximum = float(values.max())
 
-    st.stop()   # stops the rest of the code from running on the login page
+                if minimum < maximum:
+                    selected_range = st.slider(
+                        "Select range",
+                        min_value=minimum,
+                        max_value=maximum,
+                        value=(minimum, maximum)
+                    )
+
+                    filtered_df = df[
+                        df[filter_column].between(
+                            selected_range[0],
+                            selected_range[1]
+                        )
+                    ]
+                else:
+                    filtered_df = df[
+                        df[filter_column] == minimum
+                    ]
+        else:
+            options = (
+                df[filter_column]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+
+            selected_values = st.multiselect(
+                "Select values",
+                options,
+                default=options[:5]
+            )
+
+            filtered_df = df[
+                df[filter_column].astype(str).isin(selected_values)
+            ]
+
+        st.write("Filtered records:", len(filtered_df))
+        st.dataframe(filtered_df, use_container_width=True)
+
+        st.download_button(
+            "Download Filtered CSV",
+            filtered_df.to_csv(index=False).encode("utf-8"),
+            "filtered_data.csv",
+            "text/csv"
+        )
+
+    with tab3:
+        st.subheader("Statistical Summary")
+        st.dataframe(
+            df.describe(include="all").transpose(),
+            use_container_width=True
+        )
+
+        missing = pd.DataFrame({
+            "Column": df.columns,
+            "Missing Values": [
+                df[column].isna().sum()
+                for column in df.columns
+            ]
+        })
+
+        st.subheader("Missing Values")
+        st.dataframe(missing, use_container_width=True)
 
 
-# =====================================================================
-# USER DASHBOARD
-# =====================================================================
+if st.session_state.user is None:
+    left, right = st.columns(2)
 
-if st.session_state.role == "User":
+    with left:
+        show_hero(
+            "E-Commerce BI",
+            "Analyze your business data with interactive dashboards."
+        )
 
-    st.title("👤 User Dashboard")
-    st.write("Welcome, " + st.session_state.user_email)
+        st.write("Upload datasets, create charts and generate reports.")
 
-    st.header("Upload Your Data")
-    uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=["csv", "xlsx"])
+    with right:
+        login_tab, register_tab = st.tabs(["Login", "Register"])
 
-    if uploaded_file is not None:
-        df = read_uploaded_file(uploaded_file)
+        with login_tab:
+            with st.form("login_form"):
+                email = st.text_input("Email")
+                password = st.text_input("Password", type="password")
+                login_button = st.form_submit_button("Login")
 
-        st.write("Preview of your file:")
-        st.dataframe(df.head())
+            if login_button:
+                user = authenticate_user(email, password)
 
-        # Check if this file was already uploaded before (avoid duplicates)
-        already_uploaded = False
-        for f in storage["files"]:
-            if f["filename"] == uploaded_file.name and f["uploader"] == st.session_state.user_email:
-                already_uploaded = True
+                if user:
+                    st.session_state.user = user
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
 
-        if already_uploaded == False:
-            new_file = {
-                "filename": uploaded_file.name,
-                "uploader": st.session_state.user_email,
-                "uploaded_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "status": "Pending",
-                "data": df,
-                "report": None,
-            }
-            storage["files"].append(new_file)
-            st.success("File uploaded successfully!")
+        with register_tab:
+            with st.form("register_form"):
+                name = st.text_input("Full Name")
+                new_email = st.text_input("Email")
+                new_password = st.text_input(
+                    "Password",
+                    type="password"
+                )
+                confirm_password = st.text_input(
+                    "Confirm Password",
+                    type="password"
+                )
+                register_button = st.form_submit_button("Create Account")
 
-    st.header("My Files")
+            if register_button:
+                if new_password != confirm_password:
+                    st.error("Passwords do not match.")
+                else:
+                    success, message = register_user(
+                        name,
+                        new_email,
+                        new_password
+                    )
 
-    my_files = []
-    for f in storage["files"]:
-        if f["uploader"] == st.session_state.user_email:
-            my_files.append(f)
+                    if success:
+                        st.success(message)
+                    else:
+                        st.error(message)
 
-    if len(my_files) == 0:
-        st.info("You have not uploaded any files yet.")
+    st.stop()
+
+
+user = st.session_state.user
+
+with st.sidebar:
+    st.title("E-Commerce BI")
+    st.write("Welcome,", user["name"])
+    st.write("Role:", user["role"])
+
+    if user["role"] == "analyst":
+        pages = [
+            "Dashboard",
+            "All Uploads",
+            "Analyze Dataset",
+            "Reports",
+            "Profile"
+        ]
     else:
-        for f in my_files:
-            st.write("📄 " + f["filename"] + " — Status: " + f["status"])
-            if f["status"] == "Completed":
-                with st.expander("View Report"):
-                    st.text(f["report"])
+        pages = [
+            "Dashboard",
+            "Upload Data",
+            "My Uploads",
+            "Published Reports",
+            "Profile"
+        ]
 
-    st.divider()
+    page = st.radio("Navigation", pages)
 
-    # Chatbot uses the user's most recently uploaded file (if any)
-    last_df = my_files[-1]["data"] if len(my_files) > 0 else None
-    show_chatbot(last_df)
-
-    st.divider()
     if st.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.role = None
+        st.session_state.user = None
         st.rerun()
 
 
-# =====================================================================
-# ANALYST DASHBOARD
-# =====================================================================
+if page == "Dashboard":
+    show_hero(
+        f"Welcome, {user['name']}",
+        "Your business intelligence dashboard"
+    )
 
-if st.session_state.role == "Analyst":
+    uploads = (
+        get_uploads()
+        if user["role"] == "analyst"
+        else get_uploads(user["id"])
+    )
 
-    st.title("📊 Analyst Dashboard")
-    st.success("Welcome, Analyst!")
-
-    all_files = storage["files"]
-
-    pending_count = 0
-    completed_count = 0
-    for f in all_files:
-        if f["status"] == "Pending":
-            pending_count += 1
-        if f["status"] == "Completed":
-            completed_count += 1
+    reports = get_reports()
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Files", len(all_files))
-    col2.metric("Pending", pending_count)
-    col3.metric("Completed", completed_count)
+    col1.metric("Datasets", len(uploads))
+    col2.metric("Reports", len(reports))
+    col3.metric("Role", user["role"].title())
 
-    st.header("Files Uploaded by Users")
-
-    if len(all_files) == 0:
-        st.info("No files uploaded yet.")
-        selected_df = None
+    if uploads:
+        st.dataframe(
+            pd.DataFrame(uploads).drop(
+                columns=["stored_path"],
+                errors="ignore"
+            ),
+            use_container_width=True
+        )
     else:
-        file_names = []
-        for f in all_files:
-            file_names.append(f["filename"] + " (from " + f["uploader"] + ")")
+        st.info("Upload a dataset to get started.")
 
-        chosen = st.selectbox("Select a file to analyze", file_names)
-        chosen_index = file_names.index(chosen)
-        selected_file = all_files[chosen_index]
-        selected_df = selected_file["data"]
 
-        st.write("Preview:")
-        st.dataframe(selected_df.head(10))
+elif page == "Upload Data":
+    show_hero("Upload Dataset", "Choose a CSV or Excel file")
 
-        # Simple built-in chart (no extra libraries needed)
-        numeric_columns = selected_df.select_dtypes(include="number").columns
-        if len(numeric_columns) > 0:
-            chart_column = st.selectbox("Choose a column to chart", numeric_columns)
-            st.line_chart(selected_df[chart_column])
+    uploaded_file = st.file_uploader(
+        "Select file",
+        type=["csv", "xlsx", "xls"]
+    )
 
-        if st.button("Run Analysis and Mark Completed"):
-            selected_file["report"] = analyze_data(selected_df)
-            selected_file["status"] = "Completed"
-            st.success("Analysis complete! The user can now see the report.")
-            st.rerun()
+    if uploaded_file:
+        try:
+            if uploaded_file.name.lower().endswith(".csv"):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
 
-        if selected_file["report"] is not None:
-            st.subheader("Report")
-            st.text(selected_file["report"])
+            st.dataframe(df.head(10), use_container_width=True)
 
-    st.divider()
-    show_chatbot(selected_df)
+            if st.button("Save Dataset"):
+                path = store_file(uploaded_file, user["id"])
 
-    st.divider()
-    if st.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.role = None
-        st.rerun()
+                save_upload(
+                    user["id"],
+                    uploaded_file.name,
+                    str(path),
+                    len(df),
+                    len(df.columns)
+                )
+
+                st.success("Dataset uploaded successfully.")
+                st.rerun()
+
+        except Exception as error:
+            st.error(f"File error: {error}")
+
+
+elif page in ["My Uploads", "All Uploads"]:
+    uploads = (
+        get_uploads()
+        if user["role"] == "analyst"
+        else get_uploads(user["id"])
+    )
+
+    st.subheader("Dataset Library")
+
+    if uploads:
+        choices = {
+            f"{item['id']} - {item['filename']}": item["id"]
+            for item in uploads
+        }
+
+        selected = st.selectbox(
+            "Choose dataset",
+            list(choices.keys())
+        )
+
+        st.dataframe(
+            pd.DataFrame(uploads).drop(
+                columns=["stored_path"],
+                errors="ignore"
+            ),
+            use_container_width=True
+        )
+
+        if st.button("Open Dataset"):
+            st.session_state.selected_upload_id = choices[selected]
+
+        upload_id = st.session_state.selected_upload_id
+
+        if upload_id in [item["id"] for item in uploads]:
+            item = get_upload(upload_id)
+
+            if item and os.path.exists(item["stored_path"]):
+                df = load_dataset(item["stored_path"])
+                display_dataset(df)
+            else:
+                st.warning("Dataset file not found.")
+    else:
+        st.info("No datasets found.")
+
+
+elif page == "Analyze Dataset":
+    uploads = get_uploads()
+
+    st.subheader("Analyze Dataset")
+
+    if uploads:
+        choices = {
+            f"{item['id']} - {item['filename']}": item["id"]
+            for item in uploads
+        }
+
+        selected = st.selectbox(
+            "Choose dataset",
+            list(choices.keys())
+        )
+
+        item = get_upload(choices[selected])
+
+        if item and os.path.exists(item["stored_path"]):
+            df = load_dataset(item["stored_path"])
+            display_dataset(df)
+
+            st.subheader("Publish Report")
+
+            with st.form("report_form"):
+                title = st.text_input(
+                    "Report Title",
+                    value=f"Analysis - {item['filename']}"
+                )
+
+                summary = st.text_area(
+                    "Report Summary",
+                    value=generate_report(df, item["filename"])
+                )
+
+                publish = st.form_submit_button("Publish Report")
+
+            if publish:
+                if title.strip() and summary.strip():
+                    save_report(
+                        choices[selected],
+                        user["id"],
+                        title,
+                        summary
+                    )
+                    st.success("Report published.")
+                    st.rerun()
+                else:
+                    st.error("Enter a report title and summary.")
+    else:
+        st.info("No datasets available.")
+
+
+elif page in ["Reports", "Published Reports"]:
+    st.subheader("Published Reports")
+
+    reports = get_reports()
+
+    if reports:
+        for report in reports:
+            with st.expander(report["title"]):
+                st.write("Dataset:", report["filename"])
+                st.write("Analyst:", report["analyst_name"])
+                st.text(report["summary"])
+
+                st.download_button(
+                    "Download Report",
+                    report["summary"],
+                    file_name=f"report_{report['id']}.txt",
+                    key=f"download_{report['id']}"
+                )
+    else:
+        st.info("No reports published yet.")
+
+
+elif page == "Profile":
+    show_hero("My Profile", "Your account details")
+
+    st.write("Name:", user["name"])
+    st.write("Email:", user["email"])
+    st.write("Role:", user["role"].title())
+
+
+st.divider()
+st.caption("E-Commerce Business Intelligence Dashboard")
